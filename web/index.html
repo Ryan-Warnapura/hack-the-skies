@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101519">
+  <meta name="description" content="Turn a real-world location and your photos into an explorable Minecraft Java world.">
+  <title>RealityForge — World builder</title>
+  <link rel="stylesheet" href="/vendor/leaflet.css">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="importmap">{"imports":{"three":"/vendor/three.module.js"}}</script>
+  <script src="/vendor/leaflet.js" defer></script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+    <symbol id="i-cube" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7l9-5Zm0 10 9-5M12 12 3 7m9 5v10M7.5 4.5l9 5"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M19 10c0 5-7 11-7 11S5 15 5 10a7 7 0 1 1 14 0Z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+    <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path d="m3 17 5-5 4 4 4-6 5 7"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 11a9 9 0 1 1 2 7M3 4v7h7"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18m6-18v18M3 9h18M3 15h18"/></symbol>
+    <symbol id="i-top" viewBox="0 0 24 24"><path d="m3 9 9-6 9 6-9 6-9-6Zm0 6 9 6 9-6"/></symbol>
+    <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 3h7v7m0-7L10 14M10 3H3v18h18v-7"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.4 6.6L21 12l-6.6 2.4L12 21l-2.4-6.6L3 12l6.6-2.4L12 3Z"/></symbol>
+  </defs></svg>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="RealityForge home"><span class="brand-symbol"><svg class="icon"><use href="#i-cube"/></svg></span><span>Reality<span class="brand-light">Forge</span></span><span class="alpha">LAB</span></a>
+    <div class="topbar-center"><span class="nav-active">World builder</span><span class="nav-divider"></span><span class="muted small">From place to playable</span></div>
+    <div class="topbar-right"><span class="engine-state"><i id="engine-dot"></i><span id="engine-status">Connecting</span></span><button id="demo-button" class="button button-small button-outline"><svg class="icon"><use href="#i-spark"/></svg>Try a demo</button></div>
+  </header>
+
+  <main class="workspace">
+    <div class="workspace-heading"><div><div class="eyebrow">REAL WORLD → MINECRAFT JAVA</div><h1>A place you know. A world you can explore.</h1><p>Choose your neighbourhood. Add your perspective. Make it playable.</p></div><div class="edition"><span class="edition-mark">J</span><div>Java Edition<span>1.20.4 world export</span></div></div></div>
+    <div class="builder-layout">
+      <aside class="config-panel" aria-label="World configuration">
+        <form id="world-form">
+          <section class="config-section location-section">
+            <div class="section-heading"><h2><span class="step-number">01</span>Choose a place</h2><span class="section-tag">MAP DATA</span></div>
+            <label class="field-label" for="world-name">World name</label><input id="world-name" name="name" value="My neighbourhood" maxlength="70" required>
+            <div class="map-wrap"><div id="map" role="region" aria-label="Location map, click to set the centre"></div><span class="map-hint">Click the map to move your area</span><span id="map-offline" class="map-offline" hidden>Map tiles unavailable. Coordinates still work.</span></div>
+            <div class="coordinate-row"><label>Latitude<input id="latitude" type="number" value="43.6532" step="any" min="-85" max="85" required></label><label>Longitude<input id="longitude" type="number" value="-79.3832" step="any" min="-180" max="180" required></label></div>
+            <label class="field-label" for="coverage">Area width <span>A square centred on your pin</span></label>
+            <div class="segmented" id="coverage-options" role="group" aria-label="Area width"><button type="button" data-coverage="250" class="active" aria-pressed="true">250 m</button><button type="button" data-coverage="500" aria-pressed="false">500 m</button><button type="button" data-coverage="1000" aria-pressed="false">1 km</button><button type="button" data-coverage="custom" aria-pressed="false">Custom</button></div>
+            <div id="custom-coverage" hidden><label class="field-label" for="coverage">Width in metres</label><input id="coverage" type="number" min="50" max="1000" step="10" value="250"></div>
+            <details class="location-details"><summary>Use Google Maps or exact bounds <span>+</span></summary><div class="detail-content"><label class="field-label" for="google-location">Google Maps link or coordinates</label><div class="inline-input"><input id="google-location" type="text" placeholder="Paste a Maps URL or lat, lon"><button type="button" id="parse-location" class="button button-outline">Set</button></div><p class="helper">Uses coordinates from the link. Map geometry comes from OpenStreetMap; Google imagery is not downloaded.</p><div class="map-links"><a id="google-map-link" target="_blank" rel="noopener noreferrer">Open Maps <svg class="icon"><use href="#i-external"/></svg></a><a id="streetview-link" target="_blank" rel="noopener noreferrer">Street View <svg class="icon"><use href="#i-external"/></svg></a></div><label class="check-label"><input id="use-bbox" type="checkbox">Enter an exact bounding box</label><div class="bounds-grid" id="bounds-fields"><label>West<input id="bbox-west" type="number" step="any"></label><label>South<input id="bbox-south" type="number" step="any"></label><label>East<input id="bbox-east" type="number" step="any"></label><label>North<input id="bbox-north" type="number" step="any"></label></div></div></details>
+          </section>
+
+          <section class="config-section">
+            <div class="section-heading"><h2><span class="step-number">02</span>Add your perspective</h2><span class="optional">OPTIONAL</span></div>
+            <label for="photo-files" class="upload-zone" id="upload-zone"><span class="upload-icon"><svg class="icon"><use href="#i-photo"/></svg></span><strong>Drop photos or a panorama</strong><span>or <span class="lime-text">browse files</span> · JPG, PNG, WebP</span><input id="photo-files" type="file" accept="image/jpeg,image/png,image/webp" multiple></label>
+            <p class="helper">Photos guide nearby building palettes and hand-built assets. This prototype does not recover exact 3D shapes from an image.</p>
+            <div id="photo-list" class="photo-list" aria-live="polite"></div>
+          </section>
+
+          <section class="config-section settings-section">
+            <div class="section-heading"><h2><span class="step-number">03</span>Make it yours</h2></div>
+            <div class="settings-row"><label for="resolution">World scale<span>Metres per Minecraft block</span></label><select id="resolution"><option value="1">1 m / block</option><option value="2">2 m / block</option><option value="4">4 m / block</option></select></div>
+            <label class="toggle-row" for="terrain"><span>Use terrain elevation<span>When elevation data is available</span></span><input id="terrain" type="checkbox"><span class="toggle" aria-hidden="true"></span></label>
+            <div class="size-summary"><svg class="icon"><use href="#i-grid"/></svg><span id="size-summary">250 × 250 blocks</span><span id="area-summary">0.06 km²</span></div>
+          </section>
+          <div class="generate-wrap"><button id="generate-button" type="submit" class="button button-primary"><svg class="icon"><use href="#i-cube"/></svg><span id="generate-label">Generate Java world</span><svg class="icon arrow"><use href="#i-arrow"/></svg></button><p>3D model → schematic → Minecraft world</p></div>
+        </form>
+      </aside>
+
+      <section class="result-column" aria-label="World preview and export">
+        <div class="preview-panel" id="preview-panel">
+          <div class="preview-header"><div><span class="live-dot"></span><h2>World preview</h2><span class="preview-mode">3D SCENE</span></div><span id="scene-source" class="source-chip">Loading sample</span></div>
+          <div id="viewport" class="viewport" tabindex="0" aria-label="Interactive 3D world preview. Drag to orbit, scroll to zoom, right-drag to pan.">
+            <div class="viewport-topline"><span id="scene-name">Your next world starts here</span><span id="scene-dimensions"></span></div>
+            <div class="compass" aria-label="North is toward negative Z"><span>N</span><div>↑</div></div>
+            <div id="preview-loading" class="preview-loading"><span class="loader"></span><span>Preparing your view…</span></div>
+            <div id="webgl-error" class="webgl-error" hidden><svg class="icon"><use href="#i-cube"/></svg><strong>3D preview unavailable</strong><p>Your browser could not start WebGL. You can still generate and download a world.</p></div>
+            <div class="preview-tools" aria-label="Preview controls"><button type="button" id="reset-view" title="Reset camera" aria-label="Reset camera"><svg class="icon"><use href="#i-reset"/></svg></button><button type="button" id="top-view" title="Top view" aria-label="Top view"><svg class="icon"><use href="#i-top"/></svg></button><button type="button" id="toggle-grid" title="Toggle grid" aria-label="Toggle grid" aria-pressed="false"><svg class="icon"><use href="#i-grid"/></svg></button><button type="button" id="fullscreen" title="Expand preview" aria-label="Expand preview"><svg class="icon"><use href="#i-expand"/></svg></button></div>
+            <div class="preview-footer"><div class="scene-legend"><span><i class="legend-building"></i>Buildings</span><span><i class="legend-nature"></i>Vegetation</span><span><i class="legend-road"></i>Roads</span></div><span class="orbit-hint">Drag to orbit · Scroll to zoom</span></div>
+          </div>
+          <div class="scene-stats"><div><span class="stat-label">BUILDINGS</span><strong id="stat-buildings">—</strong></div><div><span class="stat-label">ROADS</span><strong id="stat-roads">—</strong></div><div><span class="stat-label">TREES</span><strong id="stat-trees">—</strong></div><div><span class="stat-label">COVERAGE</span><strong id="stat-coverage">—</strong></div><span class="stats-caption" id="stats-caption">A semantic scene, ready to become blocks.</span></div>
+        </div>
+
+        <div class="pipeline-panel"><div class="pipeline-title"><div><h2>Your world, one layer at a time</h2><p id="pipeline-message">Map geometry sets the structure. Your photos give it character.</p></div><span id="pipeline-percent">READY WHEN YOU ARE</span></div><div class="pipeline-steps"><div class="pipeline-step" data-stage="0"><span class="pipeline-node">01</span><span>Gather the place<small>Maps + your photos</small></span></div><div class="pipeline-connector"></div><div class="pipeline-step" data-stage="1"><span class="pipeline-node">02</span><span>Build the scene<small>Semantic 3D model</small></span></div><div class="pipeline-connector"></div><div class="pipeline-step" data-stage="2"><span class="pipeline-node">03</span><span>Make it playable<small>Schematic + Java world</small></span></div></div><div class="progress-track" role="progressbar" aria-label="World generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-bar"></div></div></div>
+
+        <div class="exports-panel" id="exports-panel" hidden><div class="exports-title"><div><span class="eyebrow">READY TO EXPLORE</span><h2>Your world is ready.</h2><p>Unzip the world into Minecraft Java’s <code>saves</code> folder.</p></div><a id="download-world" class="button button-primary" download><svg class="icon"><use href="#i-download"/></svg>Download Java world</a></div><div class="secondary-downloads"><a id="download-schematic" download><svg class="icon"><use href="#i-download"/></svg>Schematic <span>.schem</span></a><a id="download-model" download><svg class="icon"><use href="#i-download"/></svg>3D model <span>.obj</span></a><a id="download-scene" download>Scene <span>.json</span></a><a id="download-report" download>Build report <svg class="icon"><use href="#i-external"/></svg></a></div><details class="import-help"><summary>How to open your world in Minecraft</summary><ol><li>Download and unzip the Java world ZIP.</li><li>Copy the extracted world folder (the one with <code>level.dat</code>) into <code>%APPDATA%\.minecraft\saves</code> on Windows.</li><li>Launch Minecraft Java 1.20.4 or newer, choose Singleplayer, and open your world. Use Creative flight to explore.</li></ol><p>For WorldEdit, put the <code>.schem</code> file in its schematics folder, then use <code>//schem load filename</code> and <code>//paste</code>.</p></details></div>
+        <div class="workspace-note"><svg class="icon"><use href="#i-pin"/></svg><p id="provenance-note">Live builds use OpenStreetMap. The sample is a synthetic neighbourhood, included for a reliable offline demo. Photo styling is an approximation.</p><span>BUILT FOR EXPLORING</span></div>
+      </section>
+    </div>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
