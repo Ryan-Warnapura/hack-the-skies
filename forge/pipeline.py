@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from .geography import demo_osm, fetch_elevation, fetch_osm, validate_bbox
-from .minecraft import write_java_world, write_schematic
+from .minecraft import write_java_world, write_schematic, scene_entities
 from .scene import build_scene, export_obj, scene_to_voxels
 
 
@@ -29,7 +29,7 @@ def generate(request: dict, output: Path, cache: Path, progress=lambda *args: No
     if demo:
         warnings.append("Synthetic demo: these buildings and streets are invented, not a reconstruction of the selected coordinates.")
     progress(30, "model", "Building semantic 3D geometry and applying nearby photo materials")
-    scene = build_scene(osm, bbox, request.get("meters_per_block", 1), request.get("photos", []), elevation)
+    scene = build_scene(osm, bbox, request.get("meters_per_block", 1), request.get("photos", []), elevation, request.get("annotations", []))
     scene["name"] = request.get("name", "RealityForge")
     scene["source"] = "demo" if demo else "live"
     scene["data_attribution"] = osm["realityforge_source"]
@@ -48,7 +48,7 @@ def generate(request: dict, output: Path, cache: Path, progress=lambda *args: No
     progress(65, "schematic", "Writing a Sponge v2 schematic")
     metadata = {"name": scene["name"], "bbox": bbox, "meters_per_block": request.get("meters_per_block", 1),
                 "source": scene["data_attribution"], "pipeline": "semantic 3D scene -> Sponge schematic -> Java Anvil world"}
-    write_schematic(output / "realityforge.schem", blocks, palette, metadata)
+    write_schematic(output / "realityforge.schem", blocks, palette, metadata, entities=scene_entities(scene))
     non_air = int((blocks != palette.index("minecraft:air")).sum())
     del blocks
     progress(76, "world", "Reading the schematic and writing Minecraft Java region files")
@@ -59,6 +59,8 @@ def generate(request: dict, output: Path, cache: Path, progress=lambda *args: No
         "source": scene["data_attribution"], "terrain": scene["terrain"].get("source", "Flat approximation"),
         "bounds": scene["bounds"], "statistics": {**scene.get("stats", {}), "non_air_blocks": non_air, "palette_size": len(palette)},
         "photo_count": len(request.get("photos", [])), "limitations": scene["limitations"],
+        "tree_placement": scene.get("tree_placement", []),
+        "annotation_rejections": scene.get("stats", {}).get("annotations_dropped", []),
         "attribution": ["RealityForge: original implementation inspired by Arnis (https://github.com/louis-e/arnis).",
                         "Live map data © OpenStreetMap contributors, ODbL: https://www.openstreetmap.org/copyright",
                         "Terrain: Mapzen/AWS Terrain Tiles. Source dataset attribution: https://github.com/tilezen/joerd/blob/master/docs/attribution.md"],

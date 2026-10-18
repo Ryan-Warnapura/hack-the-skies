@@ -13,3 +13,7 @@ Python packages are installed, not copied into the source archive. Their distrib
 Minecraft is a trademark of Mojang/Microsoft. RealityForge does not distribute Minecraft game files or textures. All exported hand-built assets use standard block identifiers.
 
 Technical format reference: Sponge Schematic Specification v2, https://github.com/SpongePowered/Schematic-Specification/blob/master/versions/schematic-2.md.
+
+The public Toronto OSM fixture in tests/fixtures/toronto-osm.json is © OpenStreetMap contributors, ODbL, fetched for the bounded City Hall validation area.
+
+User-supplied local references: free-treebundle-5-trees.zip (five individual Sponge v3 oak-style trees) and sampletree.schem (Sponge v2 display/collection). The bundle includes no licence document; original references are not redistributed in source. The optional gitignored local configuration points to the supplied ZIP. Generated local examples may include resized geometry. Source DataVersion3955 is not treated as proof of Java1.20.4 compatibility; imported states are limited to supported tree block names.

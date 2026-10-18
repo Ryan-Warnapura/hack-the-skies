@@ -1,6 +1,6 @@
 # RealityForge
 
-Turn a bounding box into a Minecraft **Java Edition** world, with local photos guiding nearby building materials. Original Python + browser JavaScript implementation, inspired by [Arnis](https://github.com/louis-e/arnis). No Rust and no Bedrock output.
+Turn a bounding box into a Minecraft **Java Edition** world, with local photos guiding nearby building materials and vegetation estimates. Original Python + browser JavaScript implementation, inspired by [Arnis](https://github.com/louis-e/arnis). No Rust and no Bedrock output.
 
 **Working MVP:** select a location, upload optional phone photos/panoramas, inspect the 3D scene, and download a `.schem` or Java world. No API key, paid service, GPU, or Minecraft mod is needed to generate a world.
 
@@ -12,6 +12,10 @@ Turn a bounding box into a Minecraft **Java Edition** world, with local photos g
 4. Try **Offline demo**, then generate. The demonstration geometry is synthetic and clearly labelled.
 5. For a real location, choose live map mode, click the map or paste coordinates/a full Google Maps location URL, and generate.
 
+From PowerShell in this folder, run `npm run dev` or `.\start.bat`. The npm command is a Windows shortcut to the Python launcher; `npm install` is not required.
+
+If RealityForge is already running, the launcher prints its address and exits successfully. If another application occupies port 8000, run `npm run dev -- --port 8001` and open http://127.0.0.1:8001 instead.
+
 On macOS/Linux: `python3 -m venv .venv`, activate the environment, `python -m pip install -r requirements-lock.txt`, then `python -m forge serve`.
 
 ## What the pipeline actually does
@@ -22,15 +26,31 @@ Bounding box + OpenStreetMap + optional public elevation + local photos
   -> rasterized Minecraft block volume
   -> Sponge v2 schematic (realityforge.schem)
   -> read that schematic back
-  -> Minecraft Java Anvil world (level.dat + region/*.mca)
+  -> Minecraft Java Anvil world (level.dat + region/*.mca + entities/*.mca)
   -> RealityForge-world.zip + report.json
 ```
 
-The semantic scene is a 3D model of building footprints/heights, road paths, trees, green space, water and terrain. It is the authoritative model consumed by the voxelizer; the OBJ is its mesh export. Buildings have rule-based walls, windows, floors and roofs; trees have trunks and canopies. This is **not photogrammetry or a learned 3D reconstruction model**.
+The semantic scene is a 3D model of building footprints/heights, road paths, trees, green space, water and terrain. It is the authoritative model consumed by the voxelizer; the OBJ is its mesh export. Buildings have rule-based walls, windows, floors and roofs; trees use species-specific branching assets, asymmetric foliage and optional locally supplied tree schematics. People are static dressed armour stands; vehicles and street furniture have shared preview/OBJ/block geometry. This is **not photogrammetry or a learned 3D reconstruction model**.
+
+Photos supply deterministic material, foliage-colour and low-confidence vegetation estimates. A reversible crop editor can remove screenshot overlays. Panorama mode comes from metadata or explicit selection, not aspect ratio. True EXIF camera heading, field of view and estimated object distance constrain nearby estimates; magnetic headings require correction. Per-photo tree styles include bare winter trees. Trees are chosen from OSM species/genus/leaf type first, then photo hints and seeded variation. Photos do not identify exact species reliably.
 
 Photos supply a deterministic colour/material estimate. You can correct it using brick, stone, wood or modern style. That choice dresses nearby mapped buildings inside the photo's influence radius. Photos are anchored to the selected position; adjust their position when captured elsewhere. One panorama does not reveal hidden facades or distant geometry. Map features beyond the photos use map tags and reasonable defaults.
 
-For the hackathon, use map coverage of **250 m across** first. Coverage is the side length of the selected square, **not a radius**. 500 m and 1 km are supported, with custom bounds from 32 m to 1 km per side. At 1 metre/block, a 1 km square is roughly 1,000 × 1,000 blocks; use 2 or 4 metres/block for faster larger exports. Buildings and terrain heights are capped to the prototype's 128-block vertical budget; see each generation report.
+For the hackathon, use map coverage of **250 m across** first. Coverage is the side length of the selected square, **not a radius**. 250 m, 500 m, 1 km and **5 km** are supported, with custom bounds from 32 m to 5 km per side. The browser automatically selects a coarser scale when necessary. A 5 km square uses **8 metres/block**, producing 625 × 625 blocks. Use 1 metre/block in a smaller area for street-level detail. At coarse scales, vehicles shorter than two blocks are omitted, people use small armour stands at 2 m/block and are omitted at 4/8 m/block, and tiny features are quantized. Geometry is not inflated merely to keep details visible. Buildings and terrain heights are capped to the prototype's 128-block vertical budget; see each generation report.
+
+## Added map detail and annotations
+
+The generator supports oak, maple, birch, spruce, pine, dark oak, bare winter, flowering/cherry and shrub styles. Unknown species are estimates, not botanical observations. Sidewalk roots are allowed; carriageway roots move no more than three blocks or receive a recorded drop reason. Reports include OSM totals, placed/snapped/dropped counts and species distribution.
+
+Map data includes tree rows, shrubs, gardens, playgrounds, surface parking, streetlights, benches, bollards, fences, bus stops, crossings and tram tracks. Underground parking is deliberately not drawn as a surface car park. Ten vehicle assets are available, placed only where their full footprints fit. Pedestrian density is capped near one per 400 m² of mapped walkable area and 300 total; explicit annotations may exceed the density estimate but not the hard cap.
+
+Expand **Add or correct map details**, choose a tree, vehicle or person, and click inside the area. Choose species, vehicle type/colour or outfit; optionally correct a nearby existing object. Valid annotations enter `scene.json` as `user_annotation`, confidence 1. Invalid placements are explained in the report. Confidence 1 records a user decision, not independently verified geography.
+
+## Local tree references
+
+The supplied five-tree ZIP is used locally through gitignored `data/tree_templates.json`. Oversized trees (up to 115 blocks tall) are cropped and resampled to the selected tree height before placement. Wood, leaves, supported slab/stair states and orientation are retained. The large `sampletree.schem` appears to contain a collection/display and is not placed as one enormous tree.
+
+Without the local ZIP/configuration, original procedural trees remain fully functional. Reference files are not included in the source archive because the provided bundle contains no licence file. The locally generated sample worlds do contain scaled reference-tree geometry. See `forge/tree_templates.py` for the optional config format.
 
 ## Import into Minecraft Java
 
@@ -70,9 +90,9 @@ Choose an empty output folder. Bounding box order is **west longitude, south lat
 
 ## Files and privacy
 
-`forge/geography.py` fetches bounded map/elevation data. `photos.py` estimates materials. `scene.py` builds models and voxelizes them. `minecraft.py` writes schematic and Java formats. `pipeline.py` enforces the conversion sequence. `app.py` is the local FastAPI service. `web/` contains the interface and vendored browser libraries.
+`forge/geography.py` fetches bounded map/elevation data. `photos.py` estimates appearance and handles crop/camera hints. `enrichment.py`, `population.py`, `assets.py` and `tree_templates.py` build shared detailed assets. `scene.py` builds models and voxelizes them. `minecraft.py` writes schematic and Java formats. `pipeline.py` enforces the conversion sequence. `app.py` is the local FastAPI service. `web/` contains the interface and vendored browser libraries.
 
-Uploaded images remain in `data/uploads/` on this computer, resized to at most 4,096 pixels and stripped of EXIF metadata. They are not sent to AI services. `data/jobs/` contains exports; `data/cache/` contains public map/elevation responses. All three are excluded from Git. Delete these folders to clear your local history while the app is stopped. The map loads public OSM tiles; live generation sends the selected bounding box to Overpass and requests public terrain tiles if enabled.
+Uploaded images remain in `data/uploads/` on this computer, resized to at most 4,096 pixels and stripped of embedded EXIF metadata. A sanitized original supports reversible cropping; selected GPS/direction/panorama metadata is retained in local JSON sidecars for analysis. They are not sent to AI services. `data/jobs/` contains exports; `data/cache/` contains public map/elevation responses. All three are excluded from Git. Delete these folders to clear your local history while the app is stopped. The map loads public OSM tiles; live generation sends the selected bounding box to Overpass and requests public terrain tiles if enabled.
 
 The server binds to `127.0.0.1`. It is a local hackathon tool, not a multi-user hosted service. Deployment needs authentication, isolated workers, storage quotas and a job system.
 
@@ -94,13 +114,15 @@ To upload later, create an empty repository on GitHub, then use `git remote add 
 
 ## Limitations and next steps
 
-- Photo matching is a palette heuristic with manual style correction, not semantic image segmentation, depth estimation or camera-pose reconstruction. Panoramas are accepted as wide images, not projected into a textured mesh.
+- Default photo analysis uses conservative colour/component heuristics, not recovered depth or exact geometry. People/vehicle counts stay unknown unless a compatible optional local ONNX model is supplied. The adapter has graceful fallback but no real model weights were installed or validated. Complex screenshot overlays require manual cropping. Panoramas are not projected into a textured mesh.
 - Unmapped objects cannot be recovered from map data. Architectural details, interiors and landmarks use generic assets; complex multipolygon buildings, bridges, tunnels and water levels are approximate.
 - Public DEM terrain is coarse, not survey-quality. Optional height clipping is documented in the scene report.
 - Browser preview is a lightweight semantic view; exported Minecraft blocks add voxel-specific detailing. Terrain and assets are approximations.
 - File structure and round-trip exports are tested automatically. Actual Minecraft client loading is a separate verification step; see `VALIDATION.md` for the checks completed in this workspace.
 
 After the demo: collect multi-view photo sets with camera poses, introduce segmentation/depth, align reconstructions to geographic footprints, build a richer asset library, and add in-game regression fixtures.
+
+Detailed before/after measurements, completed checks and deferred items are in `VALIDATION.md`. Optional roof-stair upgrades, balconies, storefronts and biome-aware leaf tinting remain future work.
 
 ## Credits
 

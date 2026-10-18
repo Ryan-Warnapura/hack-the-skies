@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .photos import STYLE_MATERIALS
+from .assets import BLOCK_COLORS, part_mesh, voxelize_parts
 
 
 DEFAULT_MATERIALS = {
@@ -40,6 +41,8 @@ MATERIAL_COLORS = {
 
 def material_color(material: str) -> str:
     name = material.split(":")[-1].split("[")[0]
+    if name in BLOCK_COLORS:
+        return BLOCK_COLORS[name]
     return "#" + "".join(f"{v:02x}" for v in MATERIAL_COLORS.get(name, (145, 145, 140)))
 
 
@@ -157,7 +160,8 @@ def _clip_road(a, b, width, depth):
 
 
 def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
-                photos: list[dict] | None = None, elevation: dict | None = None) -> dict:
+                photos: list[dict] | None = None, elevation: dict | None = None,
+                annotations: list[dict] | None = None) -> dict:
     """Build a JSON-serializable semantic scene from Overpass `out geom` data."""
     if len(bbox) != 4 or not all(math.isfinite(float(v)) for v in bbox):
         raise ValueError("bbox must contain finite west,south,east,north coordinates")
@@ -200,7 +204,7 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
         if el.get("type") != "relation" or el.get("tags", {}).get("type") != "multipolygon":
             continue
         tags = el.get("tags", {})
-        if not any(k in tags for k in ("building", "natural", "landuse", "leisure", "water")):
+        if not any(k in tags for k in ("building", "natural", "landuse", "leisure", "water", "amenity")):
             continue
         outer, inner = [], []
         for member in el.get("members", []):
@@ -264,10 +268,14 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
             kind = "tree"
         elif tags.get("natural") == "water" or tags.get("water") or tags.get("landuse") == "reservoir":
             kind = "water"
+        elif tags.get("amenity") == "parking":
+            kind = "parking"
         elif tags.get("leisure") in {"park", "garden", "playground"} or tags.get("landuse") in {"forest", "grass", "meadow", "recreation_ground"} or tags.get("natural") in {"wood", "grassland"}:
             kind = "park"
         if kind is None:
             continue
+        if kind == "parking" and (tags.get("parking") in {"underground", "multi-storey", "rooftop"} or _number(tags.get("layer"), 0) < 0 or _number(tags.get("level"), 0) < 0):
+            continue  # A buried garage is not a surface car park over a civic plaza.
         if kind not in {"tree", "road"}:
             points = _clip_polygon(points, width, depth)
             holes = [_clip_polygon(hole, width, depth) for hole in holes]
@@ -287,16 +295,16 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
                             "coordinates": points[0] if kind == "tree" else points,
                             "holes": holes},
                "center": center, "base_y": base_y, "height": 0,
-               "materials": materials, "source": "osm", "confidence": 0.65}
+               "materials": materials, "source": "osm", "confidence": 0.65, "tags": dict(tags)}
         if kind == "building":
             building_type = tags.get("building", "yes")
             levels = max(1, min(30, int(_number(tags.get("building:levels"), 2))))
             height_m = _number(tags.get("height"), levels * 3.2)
             if height_m / scale > 96 and "Building heights are capped at 96 blocks." not in limitations:
                 limitations.append("Building heights are capped at 96 blocks.")
-            height_blocks = max(3, min(96, round(height_m / scale)))
+            height_blocks = max(1, min(96, round(height_m / scale)))
             pitched = tags.get("roof:shape", "") in {"gabled", "hipped", "pyramidal", "half-hipped"} or (
-                "roof:shape" not in tags and building_type not in {"apartments", "commercial", "industrial", "retail", "office", "warehouse"} and levels <= 3)
+                "roof:shape" not in tags and building_type not in {"apartments", "commercial", "industrial", "retail", "office", "warehouse", "civic", "public", "government", "school", "hospital"} and levels <= 3)
             roof_height = max(1, min(6, round(2.5 / scale))) if pitched else 1
             obj.update({"levels": levels, "height": height_blocks,
                         "roof_shape": "gabled" if pitched else "flat", "roof_height": roof_height,
@@ -321,7 +329,7 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
                 if heading is not None and photo.get("projection") != "panorama":
                     bearing = math.degrees(math.atan2(center[0] - px, -(center[1] - pz))) % 360
                     delta = abs((bearing - float(heading) + 180) % 360 - 180)
-                    if delta > 65:
+                    if delta > float(photo.get("fov") or 70) / 2:
                         continue
                 nearest.append((distance, photo))
             if nearest:
@@ -339,7 +347,7 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
                              "tertiary": 8, "residential": 6, "service": 4, "footway": 2,
                              "path": 2, "cycleway": 2, "pedestrian": 4}.get(highway, 6)
             obj.update({"width": max(1, min(30 / scale, _number(tags.get("width"), default_width) / scale)),
-                        "road_type": highway, "sidewalk_width": max(1, round(1.5 / scale)),
+                        "road_type": highway, "sidewalk_width": max(0, round(1.5 / scale)),
                         "markings": highway not in {"footway", "path", "cycleway", "steps", "pedestrian"}})
             if not obj["markings"]:
                 materials["road"] = "minecraft:smooth_stone"
@@ -348,14 +356,16 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
                         "canopy_radius": max(1.5, 3 / scale)})
         elif kind == "park":
             obj["vegetation"] = "forest" if tags.get("landuse") == "forest" or tags.get("natural") == "wood" else "park"
-        obj["color"] = material_color(materials["wall" if kind == "building" else "road" if kind == "road" else "water" if kind == "water" else "leaves" if kind == "tree" else "grass"])
+        elif kind == "parking":
+            materials["surface"] = "minecraft:gravel" if tags.get("surface") in {"gravel", "fine_gravel", "unpaved"} else "minecraft:gray_concrete"
+        obj["color"] = material_color(materials["wall" if kind == "building" else "road" if kind == "road" else "water" if kind == "water" else "leaves" if kind == "tree" else "surface" if kind == "parking" else "grass"])
         objects.append(obj)
 
     # Deterministic hand-built trees inside mapped green areas. Their locations
     # are explicit approximations, not claimed observations from the images.
     for park in [o for o in objects if o["kind"] == "park"]:
         poly = park["geometry"]["coordinates"]
-        spacing = max(4, (13 if park["vegetation"] == "forest" else 21) / scale)
+        spacing = max(4, (7 if park["vegetation"] == "forest" else 12) / scale)
         minx, maxx = max(1, min(p[0] for p in poly)), min(width - 2, max(p[0] for p in poly))
         minz, maxz = max(1, min(p[1] for p in poly)), min(depth - 2, max(p[1] for p in poly))
         count = 0
@@ -386,12 +396,16 @@ def build_scene(osm: dict, bbox: list[float], meters_per_block: float = 1.0,
     if max_height > 128:
         limitations.append("Objects taller than the 128-block local build height are clipped.")
     counts = Counter(o["kind"] for o in objects)
-    return {"version": 1, "coordinate_system": "x=east,y=up,z=south; units=blocks", "bbox": list(map(float, bbox)),
+    scene = {"version": 1, "coordinate_system": "x=east,y=up,z=south; units=blocks", "bbox": list(map(float, bbox)),
             "meters_per_block": scale, "bounds": {"width": width, "depth": depth, "height": min(128, max(24, max_height))},
             "ground_y": 4, "terrain": terrain, "materials": DEFAULT_MATERIALS.copy(), "objects": objects,
             "stats": {"objects": len(objects), **dict(counts), "photo_dressed_buildings": sum(o["source"] == "osm+photo" for o in objects),
                       "photos_used": len({o.get("photo_id") for o in objects if o.get("photo_id") is not None})},
             "limitations": limitations}
+    # Import lazily: enrichment reuses projection/terrain helpers from this file.
+    from .enrichment import enrich_scene
+    enrich_scene(scene, osm, local_photos, annotations or [])
+    return scene
 
 
 def _polygon_mask(obj, width, depth):
@@ -449,6 +463,12 @@ def scene_to_voxels(scene: dict) -> tuple[np.ndarray, list[str]]:
     occupied = np.zeros((depth, width), dtype=bool)
 
     for obj in scene["objects"]:
+        if obj["kind"] == "parking":
+            mask = _polygon_mask(obj, width, depth)
+            z, x = np.where(mask)
+            blocks[ground[z, x], z, x] = block(obj["materials"].get("surface", "minecraft:gray_concrete"))
+
+    for obj in scene["objects"]:
         if obj["kind"] == "water":
             mask = _polygon_mask(obj, width, depth)
             z, x = np.where(mask)
@@ -474,7 +494,10 @@ def scene_to_voxels(scene: dict) -> tuple[np.ndarray, list[str]]:
         mask = np.asarray(im, dtype=bool)
         z, x = np.where(mask)
         blocks[ground[z, x], z, x] = block(obj["materials"]["road"])
-        occupied |= outer
+        # Sidewalks and walking paths are valid tree locations. The previous
+        # outer mask silently discarded every sidewalk-adjacent tree.
+        if obj.get("road_type") not in {"footway", "path", "cycleway", "steps", "pedestrian", "bridleway"}:
+            occupied |= mask
         if obj["markings"] and road_width >= 4:
             # A dashed line follows the polyline arc, including rotated roads.
             distance_offset = 0.0
@@ -492,7 +515,7 @@ def scene_to_voxels(scene: dict) -> tuple[np.ndarray, list[str]]:
                 distance_offset += length
 
     for obj in scene["objects"]:
-        if obj["kind"] != "building":
+        if obj["kind"] != "building" or "parts" in obj:
             continue
         mask = _polygon_mask(obj, width, depth)
         if not mask.any():
@@ -542,9 +565,9 @@ def scene_to_voxels(scene: dict) -> tuple[np.ndarray, list[str]]:
                     blocks[y][roofmask] = roof
 
     for obj in scene["objects"]:
-        if obj["kind"] != "tree":
+        if obj["kind"] != "tree" or "parts" in obj:
             continue
-        cx, cz = map(lambda v: int(round(v)), obj["geometry"]["coordinates"])
+        cx, cz = map(math.floor, obj["geometry"]["coordinates"])
         if not (0 <= cx < width and 0 <= cz < depth) or occupied[cz, cx]:
             continue
         floor_y = int(ground[cz, cx])
@@ -560,6 +583,12 @@ def scene_to_voxels(scene: dict) -> tuple[np.ndarray, list[str]]:
             blocks[y, minz:maxz, minx:maxx][canopy & available] = block(obj["materials"]["leaves"])
         for y in range(floor_y + 1, min(height, crown_y + 1)):
             blocks[y, cz, cx] = block(obj["materials"]["trunk"])
+    # Enriched placement has already resolved collisions and recorded drops.
+    # Apply the same world-coordinate parts used by OBJ/browser rendering.
+    # People remain real entities rather than duplicate block mannequins.
+    for obj in scene["objects"]:
+        if obj["kind"] != "person" and "parts" in obj:
+            voxelize_parts(blocks, obj, block)
     return blocks, palette
 
 
@@ -645,7 +674,11 @@ def export_obj(scene: dict, path: Path) -> Path:
         for obj in scene["objects"]:
             kind, geom = obj["kind"], obj["geometry"]
             name, base = obj["id"], obj["base_y"]
-            if kind == "building":
+            if "parts" in obj:
+                for index, part in enumerate(obj["parts"]):
+                    vertices, faces = part_mesh(part)
+                    mesh(name + f"_part_{index}", vertices, faces, part["material"])
+            elif kind == "building":
                 poly = geom["coordinates"]
                 n = len(poly)
                 top = base + obj["height"]
@@ -697,13 +730,14 @@ def export_obj(scene: dict, path: Path) -> Path:
                 cuboid(name + "_trunk", x - .4, base, z - .4, .8, h * .7, .8, obj["materials"]["trunk"])
                 cuboid(name + "_crown", x - radius, base + h * .45, z - radius, radius * 2, h * .4, radius * 2, obj["materials"]["leaves"])
                 cuboid(name + "_crown_top", x - radius * .7, base + h * .8, z - radius * .7, radius * 1.4, h * .2, radius * 1.4, obj["materials"]["leaves"])
-            elif kind in {"water", "park"}:
+            elif kind in {"water", "park", "parking"}:
                 poly = geom["coordinates"]
                 vertices = [(x, _terrain_height(scene["terrain"], x, z, width, depth) + 1.03, z) for x, z in poly]
                 # Avoid filling an island/courtyard when triangle centers fall in a hole.
                 faces = [t for t in _triangulate(poly) if not any(_point_inside(
                     [sum(poly[i][0] for i in t) / 3, sum(poly[i][1] for i in t) / 3], h) for h in geom.get("holes", []))]
-                mesh(name, vertices, faces, obj["materials"]["water" if kind == "water" else "grass"])
+                key = "water" if kind == "water" else "surface" if kind == "parking" else "grass"
+                mesh(name, vertices, faces, obj["materials"].get(key, "minecraft:gray_concrete"))
 
     with mtl_path.open("w", encoding="utf-8", newline="\n") as stream:
         for name, material in materials.items():

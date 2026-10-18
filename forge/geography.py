@@ -17,6 +17,46 @@ from PIL import Image
 HEADERS = {"User-Agent": "RealityForge-Hackathon/0.1 (local educational world generator)"}
 OVERPASS = ("https://overpass.private.coffee/api/interpreter", "https://overpass-api.de/api/interpreter")
 DEMO_CENTER = (43.6532, -79.3832)
+OSM_QUERY_VERSION = "details-v2"
+OSM_SELECTORS = ['way["building"]', 'relation["building"]["type"="multipolygon"]', 'way["highway"]',
+    'way["natural"~"water|wood|scrub|tree_row"]', 'relation["natural"~"water|wood|scrub"]["type"="multipolygon"]',
+    'way["waterway"]', 'way["leisure"~"park|garden|playground"]',
+    'way["landuse"~"forest|grass|meadow|recreation_ground|reservoir"]', 'node["natural"~"tree|shrub"]',
+    'way["amenity"="parking"]', 'node["highway"~"street_lamp|bus_stop|crossing"]',
+    'node["amenity"="bench"]', 'node["barrier"="bollard"]', 'way["barrier"~"fence|hedge"]',
+    'way["railway"="tram"]']
+
+
+def select_osm_features(data):
+    """Apply equivalent feature filters to Overpass and small-area API results.
+
+    Retain referenced nodes/ways for coordinate and multipolygon resolution.
+    """
+    elements = data.get("elements", [])
+    by_key = {(e["type"], e["id"]): e for e in elements}
+    selected = set()
+    for el in elements:
+        t, kind = el.get("tags", {}), el.get("type")
+        wanted = ((kind in {"way", "relation"} and (t.get("building") or
+            t.get("natural") in {"water", "wood", "scrub", "tree_row"} or
+            t.get("leisure") in {"park", "garden", "playground"} or
+            t.get("landuse") in {"forest", "grass", "meadow", "recreation_ground", "reservoir"})) or
+            (kind == "way" and (t.get("highway") or t.get("waterway") or t.get("amenity") == "parking" or
+                t.get("barrier") in {"fence", "hedge"} or t.get("railway") == "tram")) or
+            (kind == "node" and (t.get("natural") in {"tree", "shrub"} or
+                t.get("highway") in {"street_lamp", "bus_stop", "crossing"} or t.get("amenity") == "bench" or t.get("barrier") == "bollard")))
+        if wanted:
+            selected.add((kind, el["id"]))
+    pending = list(selected)
+    while pending:
+        el = by_key.get(pending.pop(), {})
+        refs = [("node", n) for n in el.get("nodes", [])]
+        refs += [(m["type"], m["ref"]) for m in el.get("members", []) if m.get("type") in {"way", "node"}]
+        for key in refs:
+            if key not in selected:
+                selected.add(key)
+                pending.append(key)
+    return {**data, "elements": [e for e in elements if (e["type"], e["id"]) in selected], "query_version": OSM_QUERY_VERSION}
 
 
 def bbox_dimensions(bbox):
@@ -31,8 +71,8 @@ def validate_bbox(bbox):
     if not (-180 <= w < e <= 180 and -85 <= s < n <= 85):
         raise ValueError("Choose an ordered bounding box between 85°S and 85°N, without crossing the date line.")
     width, depth = bbox_dimensions(bbox)
-    if min(width, depth) < 32 or max(width, depth) > 1010:
-        raise ValueError("Each side of the bounding box must be between 32 and 1,000 metres.")
+    if min(width, depth) < 32 or max(width, depth) > 5010:
+        raise ValueError("Each side of the bounding box must be between 32 and 5,000 metres.")
     return bbox
 
 
@@ -73,17 +113,13 @@ def parse_location(value: str):
 def fetch_osm(bbox, cache_dir: Path):
     validate_bbox(bbox)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha256(json.dumps(bbox).encode()).hexdigest()[:24]
+    key = hashlib.sha256(json.dumps([OSM_QUERY_VERSION, bbox]).encode()).hexdigest()[:24]
     cached = cache_dir / f"osm-{key}.json"
     if cached.exists() and time.time() - cached.stat().st_mtime < 86400:
         return json.loads(cached.read_text(encoding="utf-8"))
     w, s, e, n = bbox
     area = f"({s},{w},{n},{e})"
-    selectors = ['way["building"]', 'relation["building"]["type"="multipolygon"]', 'way["highway"]',
-                 'way["natural"="water"]', 'relation["natural"="water"]["type"="multipolygon"]',
-                 'way["waterway"]', 'way["leisure"="park"]', 'way["landuse"~"forest|grass|recreation_ground"]',
-                 'way["natural"="wood"]', 'node["natural"="tree"]']
-    query = '[out:json][timeout:35];(' + ''.join(f'{tag}{area};' for tag in selectors) + ');out geom;'
+    query = '[out:json][timeout:35];(' + ''.join(f'{tag}{area};' for tag in OSM_SELECTORS) + ');out geom;'
     errors = []
     with httpx.Client(headers=HEADERS, timeout=45, follow_redirects=False) as client:
         for endpoint in OVERPASS:
@@ -101,6 +137,7 @@ def fetch_osm(bbox, cache_dir: Path):
                     raise ValueError("Map service could not complete this area: " + data["remark"][:160])
                 if not isinstance(data.get("elements"), list) or len(data["elements"]) > 50000:
                     raise ValueError("Map response is invalid or too dense. Choose a smaller area.")
+                data = select_osm_features(data)
                 data["realityforge_source"] = "OpenStreetMap contributors (ODbL), Overpass API"
                 cached.write_text(json.dumps(data), encoding="utf-8")
                 return data
@@ -122,6 +159,7 @@ def fetch_osm(bbox, cache_dir: Path):
                 data = json.loads(b''.join(parts))
                 if not isinstance(data.get("elements"), list) or len(data["elements"]) > 50000:
                     raise ValueError("Small-area fallback is too dense.")
+                data = select_osm_features(data)
                 data["realityforge_source"] = "OpenStreetMap contributors (ODbL), small-area OSM API fallback"
                 cached.write_text(json.dumps(data), encoding="utf-8")
                 return data

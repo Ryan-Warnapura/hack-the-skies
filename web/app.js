@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
+import { mountPhotoControls } from './photo-controls.js';
 
 const $ = id => document.getElementById(id);
-const state = {source:'live', size:250, photos:[], busy:false, scene:null, job:null};
-let map, pin, rectangle, toastTimer;
+const state = {source:'live', size:250, preferredScale:1, photos:[], annotations:[], busy:false, scene:null, job:null};
+let map, pin, rectangle, toastTimer, annotationCounter=0;
+const annotationMarkers=[];
 function toast(message, error=false) {
   $('toast').textContent=message; $('toast').classList.toggle('error',error); $('toast').hidden=false;
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').hidden=true,error?12000:5000);
@@ -26,15 +28,19 @@ function bbox() {
 }
 function updateLocation(fit=false) {
   const [lat,lon]=center(); if(!Number.isFinite(lat)||!Number.isFinite(lon)||Math.abs(lat)>85||Math.abs(lon)>180)return;
-  const b=bbox(), scale=Number($('resolution').value);
+  const b=bbox(); let scale=state.preferredScale;
   if(!b.every(Number.isFinite))return;
   if(!$('use-bbox').checked) ['west','south','east','north'].forEach((side,i)=>$(`bbox-${side}`).value=b[i].toFixed(7));
   $('bounds-fields').classList.toggle('enabled',$('use-bbox').checked);
   for(const side of ['west','south','east','north'])$(`bbox-${side}`).disabled=!$('use-bbox').checked;
   if(map){pin.setLatLng([lat,lon]);rectangle.setBounds([[b[1],b[0]],[b[3],b[2]]]);if(fit)map.fitBounds(rectangle.getBounds(),{padding:[12,12],maxZoom:17});}
   const width=(b[2]-b[0])*111320*Math.cos((b[1]+b[3])/2*Math.PI/180),depth=(b[3]-b[1])*111320;
-  $('size-summary').textContent=`${Math.ceil(width/scale)} × ${Math.ceil(depth/scale)} blocks`;
+  const needed=Math.max(width,depth)/1024;
+  if(scale<needed)scale=[1,2,4,8].find(value=>value>=needed)||8;
+  $('resolution').value=String(scale);
+  $('size-summary').textContent=`${Math.ceil(width/scale-1e-7)} × ${Math.ceil(depth/scale-1e-7)} blocks`;
   $('area-summary').textContent=`${(width*depth/1e6).toFixed(2)} km²`;
+  $('scale-note').textContent=scale>1?`Overview scale: ${scale} m per block. Streets and footprints cover more ground; small details are simplified. A 5 km area uses 8 m per block.`:'1 m per block keeps the most street-level detail. Larger areas automatically use a coarser scale to fit.';
   $('google-map-link').href=`https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
   $('streetview-link').href=`https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lon}`;
 }
@@ -51,8 +57,47 @@ function initializeMap(){
   tiles.on('tileerror',()=>$('map-offline').hidden=false);tiles.on('tileload',()=>$('map-offline').hidden=true);
   pin=L.marker(center(),{icon:L.divIcon({className:'map-centre',iconSize:[13,13],iconAnchor:[6,6]})}).addTo(map);
   rectangle=L.rectangle([[0,0],[0,0]],{color:'#5e7e32',weight:2,fillColor:'#b5de70',fillOpacity:.18}).addTo(map);
-  map.on('click',e=>{if(state.busy)return;$('latitude').value=e.latlng.lat.toFixed(6);$('longitude').value=e.latlng.lng.toFixed(6);$('use-bbox').checked=false;setSource('live');updateLocation();});
+  map.on('click',e=>{if(state.busy)return;if($('annotation-kind').value!=='navigate'){addAnnotation(e.latlng.lat,e.latlng.lng);return;}$('latitude').value=e.latlng.lat.toFixed(6);$('longitude').value=e.latlng.lng.toFixed(6);$('use-bbox').checked=false;setSource('live');updateLocation();});
   updateLocation(true);
+}
+
+function updateAnnotationControls(){
+  const kind=$('annotation-kind').value;
+  for(const element of document.querySelectorAll('[data-annotation-kind]'))element.hidden=element.dataset.annotationKind!==kind;
+  $('annotation-options').hidden=kind==='navigate';
+  $('map-click-hint').textContent=kind==='navigate'?'Click the map to move your area':`Click the map to place a ${kind==='vehicle'?'vehicle':kind}`;
+}
+function renderAnnotations(){
+  for(const marker of annotationMarkers)marker.remove();annotationMarkers.length=0;
+  $('annotation-list').replaceChildren();
+  $('annotation-count').textContent=`${state.annotations.length} saved`;
+  for(const annotation of state.annotations){
+    const label=annotation.kind==='tree'?annotation.tree_species.replace('_',' ')+' tree':annotation.kind==='vehicle'?annotation.vehicle_type.replace('_',' '):'person';
+    const row=document.createElement('div');row.className='annotation-item';
+    const text=document.createElement('span');text.textContent=`${annotation.replace_id?'Correct':'Add'} ${label}`;
+    const remove=document.createElement('button');remove.type='button';remove.textContent='Remove';remove.onclick=()=>{state.annotations=state.annotations.filter(item=>item.id!==annotation.id);renderAnnotations();};
+    row.append(text,remove);$('annotation-list').append(row);
+    if(map){const popup=document.createElement('span');popup.textContent=text.textContent;const marker=L.circleMarker([annotation.lat,annotation.lon],{radius:5,color:annotation.kind==='tree'?'#bde27b':annotation.kind==='vehicle'?'#76bdea':'#e4a16a',weight:2,fillOpacity:.85}).addTo(map).bindPopup(popup);annotationMarkers.push(marker);}
+  }
+}
+function addAnnotation(lat,lon){
+  if(state.annotations.length>=200){toast('A world can include up to 200 annotations.',true);return;}
+  const b=bbox();if(lon<b[0]||lon>b[2]||lat<b[1]||lat>b[3]){toast('Place annotations inside the selected area.',true);return;}
+  const kind=$('annotation-kind').value;
+  const annotation={id:`annotation/${Date.now()}/${annotationCounter++}`,kind,lat,lon};
+  if(kind==='tree')annotation.tree_species=$('annotation-species').value;
+  else if(kind==='vehicle'){annotation.vehicle_type=$('annotation-vehicle').value;annotation.color=$('annotation-color').value;}
+  else annotation.appearance={top:$('annotation-top').value,bottom:$('annotation-bottom').value,shoes:$('annotation-shoes').value};
+  if($('annotation-replace').checked){
+    const scene=state.scene;if(!scene?.bbox||(scene.source&&scene.source!==state.source)){toast('Generate this area before correcting an existing object.',true);return;}
+    const [west,south,,north]=scene.bbox,scale=scene.meters_per_block;
+    const x=(lon-west)*111320*Math.cos((north+south)/2*Math.PI/180)/scale,z=(north-lat)*111320/scale;
+    const nearest=scene.objects.filter(object=>object.kind===kind).map(object=>({object,distance:Math.hypot(object.center[0]-x,object.center[1]-z)*scale})).sort((a,b)=>a.distance-b.distance)[0];
+    if(!nearest||nearest.distance>Math.max(20,scale*3)){toast(`No generated ${kind} is close to that click. Choose Add mode or click closer.`,true);return;}
+    annotation.replace_id=nearest.object.id;
+    state.annotations=state.annotations.filter(item=>item.replace_id!==annotation.replace_id);
+  }
+  state.annotations.push(annotation);renderAnnotations();toast('Annotation saved. Generate the world to apply it.');
 }
 
 // The preview consumes the same semantic model as the voxel generator.
@@ -64,6 +109,25 @@ const materialCache=new Map();
 function material(name){
   if(!materialCache.has(name)){const key=(name||'stone_bricks').split(':').pop().split('[')[0];materialCache.set(name,new THREE.MeshStandardMaterial({color:colors[key]||0x939a88,roughness:.9,metalness:key.includes('glass')?.15:0,side:THREE.DoubleSide}));}
   return materialCache.get(name);
+}
+function renderAssetParts(objects){
+  const batches=new Map();
+  for(const object of objects)for(const part of object.parts||[]){
+    const shape=part.shape==='ellipsoid'?'ellipsoid':'box',key=`${shape}|${part.material}`;
+    if(!batches.has(key))batches.set(key,{shape,material:part.material,parts:[]});
+    batches.get(key).parts.push(part);
+  }
+  const transform=new THREE.Object3D();
+  for(const batch of batches.values()){
+    const geometry=batch.shape==='ellipsoid'?new THREE.SphereGeometry(.5,10,6):new THREE.BoxGeometry(1,1,1);
+    const mesh=new THREE.InstancedMesh(geometry,material(batch.material),batch.parts.length);
+    batch.parts.forEach((part,index)=>{
+      transform.position.set(...part.center);transform.scale.set(...part.size);
+      transform.rotation.set(0,(part.yaw||0)*Math.PI/180,0);transform.updateMatrix();mesh.setMatrixAt(index,transform.matrix);
+    });
+    mesh.instanceMatrix.needsUpdate=true;mesh.castShadow=true;mesh.receiveShadow=true;
+    mesh.computeBoundingSphere();model.add(mesh);
+  }
 }
 function cube(x,y,z,w,h,d,mat){
   const mesh=new THREE.Mesh(new THREE.BoxGeometry(Math.max(.05,w),Math.max(.05,h),Math.max(.05,d)),material(mat));
@@ -117,11 +181,13 @@ function renderScene(scene){
   state.scene=scene;$('preview-loading').hidden=true;
   $('scene-name').textContent=scene.name||'Generated neighbourhood';$('scene-source').textContent=scene.source==='demo'?'SYNTHETIC DEMO':'LIVE MAP DATA';
   $('scene-dimensions').textContent=`${scene.bounds.width} × ${scene.bounds.depth} blocks`;
-  for(const [id,key] of [['stat-buildings','building'],['stat-roads','road'],['stat-trees','tree']])$(id).textContent=(scene.stats[key]||0).toLocaleString();
+  for(const [id,key] of [['stat-buildings','building'],['stat-roads','road'],['stat-trees','tree'],['stat-people','person'],['stat-vehicles','vehicle']])$(id).textContent=(scene.stats[key]||0).toLocaleString();
   $('stat-coverage').textContent=`${Math.round(Math.max(scene.bounds.width,scene.bounds.depth)*scene.meters_per_block)} m`;
   $('stats-caption').textContent=scene.stats.photo_dressed_buildings?`${scene.stats.photo_dressed_buildings} buildings dressed from photos.`:'Map-shaped. Hand-built details.';
   if(!renderer)return;
   if(model){model.traverse(o=>{if(o.geometry)o.geometry.dispose();});worldScene.remove(model);}
+  for(const value of materialCache.values())value.dispose();materialCache.clear();
+  Object.assign(colors,scene.block_colors||{});
   if(grid){worldScene.remove(grid);grid.geometry.dispose();grid.material.dispose();}
   model=new THREE.Group();worldScene.add(model);
   const {width,depth}=scene.bounds;
@@ -133,8 +199,9 @@ function renderScene(scene){
     geometry.computeVertexNormals();const terrain=new THREE.Mesh(geometry,material('minecraft:grass_block'));terrain.receiveShadow=true;model.add(terrain);
   }
   let detailedBuildings=0;
-  if(scene.objects.length>2000)$('stats-caption').textContent='Preview limited to 2,000 objects; exports include all.';
-  for(const object of scene.objects.slice(0,2000)){
+  renderAssetParts(scene.objects);
+  for(const object of scene.objects){
+    if('parts' in object)continue;
     const m=object.materials,points=object.geometry.coordinates,base=object.base_y;
     if(object.kind==='building'){
       polygon(object,base,object.height,m.wall);
@@ -168,7 +235,7 @@ function renderScene(scene){
     }else if(object.kind==='tree'){
       const [x,z]=points,r=object.canopy_radius||2.5,h=object.height;
       cube(x-.45,base,z-.45,.9,h*.8,.9,m.trunk);cube(x-r,base+h*.4,z-r,r*2,h*.4,r*2,m.leaves);cube(x-r*.7,base+h*.75,z-r*.7,r*1.4,h*.25,r*1.4,m.leaves);
-    }else if(object.kind==='water'||object.kind==='park')polygon(object,base+(object.kind==='water'?.2:.05),.1,m[object.kind==='water'?'water':'grass']);
+    }else if(['water','park','parking'].includes(object.kind))polygon(object,base+(object.kind==='water'?.2:.05),.1,m[object.kind==='water'?'water':object.kind==='parking'?'surface':'grass']||'minecraft:gray_concrete');
   }
   grid=new THREE.GridHelper(Math.max(width,depth)*1.3,26,0x69816a,0x425753);grid.position.set(width/2,-.1,depth/2);grid.visible=$('toggle-grid').getAttribute('aria-pressed')==='true';worldScene.add(grid);
   resetCamera();
@@ -191,6 +258,7 @@ function renderPhotos(){
       const wrap=document.createElement('label');wrap.textContent=label;const input=document.createElement('input');input.type='number';input.step='any';input.min=min;input.max=max;input.value=photo[key];input.required=true;input.onchange=()=>photo[key]=Number(input.value);wrap.append(input);controls.append(wrap);
     }
     info.append(title,summary,select,remove);card.append(img,info,controls);$('photo-list').append(card);
+    mountPhotoControls(card,photo,()=>{summary.textContent=`${photo.projection} · ${photo.suggested_style} suggestion`;},toast);
   }
 }
 async function upload(files){
@@ -198,7 +266,7 @@ async function upload(files){
   if(files.length+state.photos.length>12){toast('Choose up to 12 photos.',true);return;}
   const form=new FormData();for(const file of files)form.append('files',file);
   $('photo-files').disabled=true;toast('Reading photo palettes locally…');
-  try{const result=await api('/api/photos',{method:'POST',body:form});const [lat,lon]=center();for(const photo of result.photos)state.photos.push({...photo,lat,lon,style:'auto',radius_m:80});renderPhotos();toast('Photos added. Check their position and material style.');}
+  try{const result=await api('/api/photos',{method:'POST',body:form});const [lat,lon]=center();for(const photo of result.photos)state.photos.push({...photo,lat:photo.exif_lat??lat,lon:photo.exif_lon??lon,style:'auto',radius_m:80,projection_setting:'auto',heading:photo.heading??(photo.exif_heading_reference==='true'?photo.exif_heading:null),fov:photo.fov||70,estimated_distance_m:25,tree_style:'auto'});renderPhotos();toast('Photos added. Check their position, direction and tree style.');}
   catch(error){toast(error.message,true);}finally{$('photo-files').disabled=false;$('photo-files').value='';}
 }
 function progress(job){
@@ -212,8 +280,9 @@ async function generate(event){
   event.preventDefault();if(state.busy)return;
   state.busy=true;$('generate-button').disabled=true;$('demo-button').disabled=true;$('exports-panel').hidden=true;
   try{
-    const photos=state.photos.map(({id,lat,lon,style,radius_m})=>({id,lat,lon,style,radius_m}));
-    const job=await post('/api/generate',{name:$('world-name').value,bbox:bbox(),source:state.source,photos,terrain:$('terrain').checked,meters_per_block:Number($('resolution').value)});
+    updateLocation();
+    const photos=state.photos.map(photo=>({id:photo.id,lat:photo.lat,lon:photo.lon,style:photo.style,radius_m:photo.radius_m,heading:photo.heading??null,fov:photo.fov||70,projection:photo.projection_setting||photo.projection||'auto',estimated_distance_m:photo.estimated_distance_m||25,tree_style:photo.tree_style||'auto'}));
+    const job=await post('/api/generate',{name:$('world-name').value,bbox:bbox(),source:state.source,photos,annotations:state.annotations,terrain:$('terrain').checked,meters_per_block:Number($('resolution').value)});
     state.job=job.id;sessionStorage.setItem('realityforge-job',job.id);
     await pollJob(job.id);
   }catch(error){toast(error.message,true);$('pipeline-message').textContent=error.message;}
@@ -237,7 +306,7 @@ async function pollJob(id){
 }
 
 $('world-form').addEventListener('submit',generate);
-for(const id of ['latitude','longitude','coverage','resolution','use-bbox','bbox-west','bbox-south','bbox-east','bbox-north'])$(id).addEventListener('change',()=>{if(id==='coverage')state.size=Math.max(50,Math.min(1000,Number($('coverage').value)));if(['latitude','longitude'].includes(id))setSource('live');updateLocation(true);});
+for(const id of ['latitude','longitude','coverage','resolution','use-bbox','bbox-west','bbox-south','bbox-east','bbox-north'])$(id).addEventListener('change',()=>{if(id==='coverage'){state.size=Math.max(50,Math.min(5000,Number($('coverage').value)));$('coverage').value=state.size;}if(id==='resolution')state.preferredScale=Number($('resolution').value);if(['latitude','longitude'].includes(id))setSource('live');updateLocation(true);});
 document.querySelectorAll('[data-coverage]').forEach(button=>button.addEventListener('click',()=>{
   document.querySelectorAll('[data-coverage]').forEach(b=>{b.classList.toggle('active',b===button);b.setAttribute('aria-pressed',String(b===button));});
   const custom=button.dataset.coverage==='custom';$('custom-coverage').hidden=!custom;state.size=custom?Number($('coverage').value):Number(button.dataset.coverage);$('use-bbox').checked=false;updateLocation(true);
@@ -250,7 +319,9 @@ for(const name of ['dragleave','drop'])$('upload-zone').addEventListener(name,e=
 $('reset-view').onclick=()=>resetCamera();$('top-view').onclick=()=>resetCamera(true);
 $('toggle-grid').onclick=()=>{const visible=$('toggle-grid').getAttribute('aria-pressed')!=='true';$('toggle-grid').setAttribute('aria-pressed',visible);if(grid)grid.visible=visible;};
 $('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await $('preview-panel').requestFullscreen();}catch{toast('Fullscreen is unavailable in this browser.');}};
-setupPreview();initializeMap();updateLocation();
+$('annotation-kind').onchange=updateAnnotationControls;
+$('clear-annotations').onclick=()=>{state.annotations=[];renderAnnotations();};
+setupPreview();initializeMap();updateLocation();updateAnnotationControls();renderAnnotations();
 try{await api('/api/health');$('engine-dot').classList.add('online');$('engine-status').textContent='Local engine online';const demo=await api('/api/demo');renderScene(demo.scene);
   const previous=sessionStorage.getItem('realityforge-job');if(previous){const job=await api(`/api/jobs/${previous}`);if(job.status==='complete')await pollJob(previous);}
 }catch(error){$('engine-status').textContent='Engine unavailable';$('preview-loading').hidden=true;toast(error.message,true);}

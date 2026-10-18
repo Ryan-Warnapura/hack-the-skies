@@ -17,7 +17,9 @@ import math
 import re
 import struct
 import time
+import uuid
 import zlib
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,113 @@ WORLD_MAX_Y = 319
 MAX_BLOCKS = 100_000_000
 AIR_NAMES = {"minecraft:air", "minecraft:cave_air", "minecraft:void_air"}
 _BLOCK_STATE = re.compile(r"^[a-z0-9_.-]+:[a-z0-9_./-]+(?:\[[a-z0-9_=,.-]+\])?$")
+_ENTITY_NAMESPACE = uuid.UUID("f454726c-6974-5908-b599-85c5eba2ba38")
+_POSE_PARTS = {"Head", "Body", "LeftArm", "RightArm", "LeftLeg", "RightLeg"}
+
+
+def scene_entities(scene: dict) -> list[dict]:
+    """Convert semantic people into static Java armour stands.
+
+    Scene yaw is a geographic bearing (north=0, east=90). Minecraft yaw faces
+    south at zero and west at 90, so subtract 180. Feet stay at local base_y;
+    world export applies its Y offset only after reading the schematic.
+    UUIDs depend on the scene location and object identity, never the job ID.
+    """
+    entities = []
+    location = json.dumps(scene.get("bbox", []), separators=(",", ":"))
+    for index, obj in enumerate(scene.get("objects", [])):
+        if obj.get("kind") != "person":
+            continue
+        x, z = obj["geometry"]["coordinates"]
+        pos = [float(x), float(obj["base_y"]), float(z)]
+        identity = str(obj.get("id", f"person/{index}"))
+        entities.append({
+            "id": "minecraft:armor_stand", "pos": pos,
+            "yaw": (float(obj.get("heading", obj.get("yaw", 0))) % 360) - 180,
+            "pitch": 0.0, "outfit": dict(obj.get("outfit", {})),
+            "pose": dict(obj.get("pose", {})),
+            "small": bool(obj.get("entity_small", False)),
+            "uuid": str(uuid.uuid5(_ENTITY_NAMESPACE, f"{location}/{identity}/{pos}")),
+        })
+    return entities
+
+
+def _finite_vector(value, length: int, label: str) -> list[float]:
+    try:
+        result = [float(v) for v in value]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Entity {label} must contain {length} finite numbers.") from exc
+    if len(result) != length or not all(math.isfinite(v) for v in result):
+        raise ValueError(f"Entity {label} must contain {length} finite numbers.")
+    return result
+
+
+def _entity_uuid(entity: dict, index: int) -> uuid.UUID:
+    if entity.get("uuid"):
+        return uuid.UUID(str(entity["uuid"]))
+    stable = json.dumps(entity, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return uuid.uuid5(_ENTITY_NAMESPACE, f"{index}/{stable}")
+
+
+def _armor_item(item: str, color: int) -> Compound:
+    if not 0 <= int(color) <= 0xFFFFFF:
+        raise ValueError("Armour colors must be RGB integers between 0 and 16777215.")
+    return Compound({
+        "id": String(f"minecraft:leather_{item}"), "Count": Byte(1),
+        "tag": Compound({"display": Compound({"color": Int(int(color))})}),
+    })
+
+
+def _entity_tag(entity: dict, index: int) -> Compound:
+    """Sponge v2 uses Id, Java uses id; all extra tags share the compound."""
+    if entity.get("id", "minecraft:armor_stand") != "minecraft:armor_stand":
+        raise ValueError("RealityForge currently creates only armour stand entities.")
+    pos = _finite_vector(entity.get("pos"), 3, "position")
+    rotation = _finite_vector([entity.get("yaw", 0), entity.get("pitch", 0)], 2, "rotation")
+    outfit = entity.get("outfit", {})
+    armor = [_armor_item("boots", outfit.get("shoes", 0x292929)),
+             _armor_item("leggings", outfit.get("bottom", 0x294B70)),
+             _armor_item("chestplate", outfit.get("top", 0xC95746)),
+             _armor_item("helmet", outfit.get("head", outfit.get("skin", 0xB98666)))]
+    poses = entity.get("pose", {})
+    if any(part not in _POSE_PARTS for part in poses):
+        raise ValueError("Unsupported armour stand pose part.")
+    return Compound({
+        "Id": String("minecraft:armor_stand"),
+        "Pos": List[Double](pos), "Rotation": List[Float](rotation),
+        "Motion": List[Double]([0.0, 0.0, 0.0]),
+        "UUID": IntArray(struct.unpack(">4i", _entity_uuid(entity, index).bytes)),
+        "ShowArms": Byte(1), "NoBasePlate": Byte(1), "NoGravity": Byte(1),
+        "Invulnerable": Byte(1), "Silent": Byte(1), "Invisible": Byte(0),
+        "Small": Byte(int(bool(entity.get("small", False)))), "OnGround": Byte(1), "Health": Float(20),
+        "Fire": Short(-1), "Air": Short(300), "FallDistance": Float(0),
+        "ArmorItems": List[Compound](armor),
+        "HandItems": List[Compound]([Compound({}), Compound({})]),
+        "Pose": Compound({part: List[Float](_finite_vector(angles, 3, "pose")) for part, angles in sorted(poses.items())}),
+        "Tags": List[String](["realityforge", "pedestrian"]),
+    })
+
+
+def _entity_descriptor(tag: Compound) -> dict:
+    """Read semantic descriptors from real entity NBT, never metadata JSON."""
+    entity = {"id": str(tag.get("Id", tag.get("id", ""))),
+              "pos": _finite_vector(tag.get("Pos"), 3, "position")}
+    rotation = _finite_vector(tag.get("Rotation", [0, 0]), 2, "rotation")
+    entity.update(yaw=rotation[0], pitch=rotation[1])
+    if "UUID" in tag:
+        parts = [int(v) for v in tag["UUID"]]
+        if len(parts) != 4:
+            raise ValueError("Entity UUID must contain four integers.")
+        entity["uuid"] = str(uuid.UUID(bytes=struct.pack(">4i", *parts)))
+    if entity["id"] == "minecraft:armor_stand":
+        outfit = {}
+        for key, item in zip(("shoes", "bottom", "top", "head"), tag.get("ArmorItems", [])):
+            color = item.get("tag", {}).get("display", {}).get("color")
+            if color is not None:
+                outfit[key] = int(color)
+        entity["outfit"] = outfit
+        entity["pose"] = {part: _finite_vector(angles, 3, "pose") for part, angles in tag.get("Pose", {}).items()}
+    return entity
 
 
 def _validate_blocks(blocks: np.ndarray, palette: list[str]) -> None:
@@ -114,11 +223,16 @@ def _unsigned_short(value: int) -> Short:
     return Short(value if value <= 32767 else value - 65536)
 
 
-def write_schematic(path: Path, blocks: np.ndarray, palette: list[str], metadata: dict | None = None) -> Path:
-    """Write a gzip-compressed Sponge v2 .schem with optional JSON metadata."""
+def write_schematic(path: Path, blocks: np.ndarray, palette: list[str], metadata: dict | None = None,
+                    entities: list[dict] | None = None) -> Path:
+    """Write Sponge v2 blocks and optional real entities, in local coordinates."""
     _validate_blocks(blocks, palette)
     height, length, width = blocks.shape
     metadata = dict(metadata or {})
+    # Entity state belongs in the actual Entities list, never just a JSON blob.
+    metadata.pop("entities", None)
+    entity_tags = [_entity_tag(entity, i) for i, entity in enumerate(entities or [])]
+    _validate_entity_tags(entity_tags, width, length, height)
     root = nbtlib.File({
         "Version": Int(2),
         "DataVersion": Int(DATA_VERSION),
@@ -130,7 +244,7 @@ def write_schematic(path: Path, blocks: np.ndarray, palette: list[str], metadata
         "Palette": Compound({state: Int(index) for index, state in enumerate(palette)}),
         "BlockData": ByteArray(_encode_varints(blocks)),
         "BlockEntities": List[Compound]([]),
-        "Entities": List[Compound]([]),
+        "Entities": List[Compound](entity_tags),
         "Metadata": Compound({
             "Name": String(str(metadata.get("name", metadata.get("Name", "RealityForge")))),
             "Author": String("RealityForge"),
@@ -145,8 +259,15 @@ def write_schematic(path: Path, blocks: np.ndarray, palette: list[str], metadata
 
 
 def read_schematic(path: Path) -> tuple[np.ndarray, list[str], dict]:
-    """Read a Sponge v2 palette schematic into the same (Y, Z, X) contract."""
+    """Read blocks and metadata; actual entities appear in metadata['entities'].
+
+    Empty entity lists keep the original three-tuple metadata contract intact.
+    """
     root = nbtlib.load(str(path), gzipped=True)
+    return _read_schematic_root(root)
+
+
+def _read_schematic_root(root: nbtlib.File) -> tuple[np.ndarray, list[str], dict]:
     if int(root.get("Version", 0)) != 2:
         raise ValueError("RealityForge reads Sponge v2 schematics.")
     shape = tuple(int(root[name]) & 65535 for name in ("Height", "Length", "Width"))
@@ -168,7 +289,28 @@ def read_schematic(path: Path) -> tuple[np.ndarray, list[str], dict]:
     metadata = json.loads(str(meta["RealityForge"])) if "RealityForge" in meta else {key: value.unpack() for key, value in meta.items()}
     if not isinstance(metadata, dict):
         raise ValueError("RealityForge schematic metadata must be an object.")
+    metadata.pop("entities", None)
+    entities = [_entity_descriptor(entity) for entity in root.get("Entities", [])]
+    if entities:
+        metadata["entities"] = entities
     return blocks, palette, metadata
+
+
+def _validate_entity_tags(entities, width: int, length: int, height: int) -> None:
+    seen = set()
+    for entity in entities:
+        if not re.fullmatch(r"[a-z0-9_.-]+:[a-z0-9_./-]+", str(entity.get("Id", entity.get("id", "")))):
+            raise ValueError("Entity Id must be a namespaced Minecraft entity type.")
+        x, y, z = _finite_vector(entity.get("Pos"), 3, "position")
+        # Feet may sit exactly atop the final block layer; entity bodies are not
+        # voxel data and therefore need not fit inside the block array height.
+        if not (0 <= x < width and 0 <= z < length and 0 <= y <= height):
+            raise ValueError("Entity position is outside the schematic bounds.")
+        identity = tuple(int(v) for v in entity.get("UUID", []))
+        if identity:
+            if identity in seen:
+                raise ValueError("Entity UUIDs must be unique within a schematic.")
+            seen.add(identity)
 
 
 def _pack_longs(values: np.ndarray, bits: int) -> LongArray:
@@ -315,6 +457,57 @@ def _level_data(world_name: str, spawn: tuple[int, int, int], width: int, length
     return nbtlib.File({"Data": data}, gzipped=True)
 
 
+def _write_entity_regions(source_entities, output_dir: Path) -> None:
+    """Java 1.20.4 stores entities in separate Anvil regions, not block chunks.
+
+    Each populated entity chunk is {DataVersion, Position:[I;cx,cz], Entities}.
+    Keep every vanilla extra field from the source schematic NBT intact.
+    """
+    if not source_entities:
+        return
+    regions = {}
+    for index, original in enumerate(source_entities):
+        entity = deepcopy(original)
+        identifier = str(entity.pop("Id", entity.get("id", "")))
+        if not identifier:
+            raise ValueError("Schematic entity is missing its Id.")
+        entity["id"] = String(identifier)
+        x, y, z = _finite_vector(entity["Pos"], 3, "position")
+        entity["Pos"] = List[Double]([x, y + WORLD_BASE_Y, z])
+        if "UUID" not in entity:
+            identity = _entity_uuid(_entity_descriptor(original), index)
+            entity["UUID"] = IntArray(struct.unpack(">4i", identity.bytes))
+        cx, cz = math.floor(x / 16), math.floor(z / 16)
+        regions.setdefault((cx // 32, cz // 32), {}).setdefault((cx, cz), []).append(entity)
+    entity_dir = output_dir / "entities"
+    entity_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time())
+    for (rx, rz), chunks in sorted(regions.items()):
+        header, sector = bytearray(8192), 2
+        with (entity_dir / f"r.{rx}.{rz}.mca").open("wb") as region:
+            region.write(header)
+            for (cx, cz), entities in sorted(chunks.items()):
+                root = nbtlib.File({
+                    "DataVersion": Int(DATA_VERSION), "Position": IntArray([cx, cz]),
+                    "Entities": List[Compound](entities),
+                })
+                stream = io.BytesIO()
+                root.write(stream)
+                compressed = zlib.compress(stream.getvalue(), level=6)
+                payload = struct.pack(">I", len(compressed) + 1) + b"\x02" + compressed
+                sectors = math.ceil(len(payload) / 4096)
+                if sectors > 255:
+                    raise ValueError("An entity chunk exceeds the Anvil region allocation limit.")
+                slot = (cx % 32) + (cz % 32) * 32
+                struct.pack_into(">I", header, slot * 4, (sector << 8) | sectors)
+                struct.pack_into(">I", header, 4096 + slot * 4, timestamp)
+                region.write(payload)
+                region.write(b"\0" * (sectors * 4096 - len(payload)))
+                sector += sectors
+            region.seek(0)
+            region.write(header)
+
+
 def write_java_world(schematic_path: Path, output_dir: Path, world_name: str = "RealityForge") -> Path:
     """Read the actual schematic and write a ready-to-import Java world folder.
 
@@ -322,11 +515,16 @@ def write_java_world(schematic_path: Path, output_dir: Path, world_name: str = "
     world files are never overwritten. Schematic local Y=0 becomes world Y=60;
     generated terrain with its grass at local Y=4 therefore sits at world Y=64.
     """
-    blocks, palette, metadata = read_schematic(Path(schematic_path))
+    root = nbtlib.load(str(schematic_path), gzipped=True)
+    blocks, palette, metadata = _read_schematic_root(root)
+    source_entities = root.get("Entities", [])
+    del root  # Release compressed-block NBT arrays before allocating chunks.
+    height, length, width = blocks.shape
+    _validate_entity_tags(source_entities, width, length, height)
     if blocks.shape[0] + WORLD_BASE_Y > WORLD_MAX_Y + 1:
         raise ValueError("This schematic is too tall for the Java world build limit.")
     output_dir = Path(output_dir)
-    if (output_dir / "level.dat").exists() or (output_dir / "region").exists():
+    if any((output_dir / name).exists() for name in ("level.dat", "region", "entities")):
         raise FileExistsError("The output directory already contains a Minecraft world.")
     if "minecraft:air" not in palette:
         if len(palette) == 65536:
@@ -362,5 +560,6 @@ def write_java_world(schematic_path: Path, output_dir: Path, world_name: str = "
                         sector += sectors
                 region.seek(0)
                 region.write(header)
+    _write_entity_regions(source_entities, output_dir)
     _level_data(world_name, spawn, width, length).save(output_dir / "level.dat")
     return output_dir

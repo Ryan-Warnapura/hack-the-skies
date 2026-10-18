@@ -31,7 +31,8 @@ def test_photo_changes_only_nearby_building_materials(tmp_path):
     photo_path = tmp_path / 'brick.png'
     Image.new('RGB', (800, 300), (170, 75, 55)).save(photo_path)
     photo = analyze_photo(photo_path)
-    assert photo['projection'] == 'panorama'
+    assert photo['projection'] == 'perspective'
+    assert photo['wide_image_candidate'] is True
     bbox = centered_bbox(43.65, -79.38, 100)
     osm = demo_osm(bbox)
     plain = build_scene(osm, bbox)

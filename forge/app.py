@@ -11,7 +11,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -21,7 +21,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .geography import DEMO_CENTER, centered_bbox, demo_osm, parse_location, validate_bbox
-from .photos import analyze_photo
+from .photos import analyze_photo, extract_photo_metadata
 from .pipeline import generate
 from .scene import build_scene
 
@@ -53,6 +53,11 @@ async def local_origin(request: Request, call_next):
     return response
 
 
+TreeStyle = Literal["auto", "oak", "maple", "birch", "spruce", "pine", "dark_oak", "bare", "cherry", "shrub"]
+VehicleType = Literal["sedan", "hatchback", "suv", "pickup", "van", "taxi", "police", "delivery_truck", "bus", "streetcar"]
+HexColor = Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")]
+
+
 class PhotoSelection(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     id: str = Field(pattern=r"^[a-f0-9]{32}$")
@@ -61,15 +66,56 @@ class PhotoSelection(BaseModel):
     style: Literal["auto", "brick", "stone", "wood", "modern"] = "auto"
     radius_m: float = Field(default=80, ge=5, le=250)
     heading: float | None = Field(default=None, ge=0, lt=360)
+    fov: float = Field(default=70, ge=10, le=360)
+    projection: Literal["auto", "perspective", "panorama"] = "auto"
+    estimated_distance_m: float = Field(default=25, ge=5, le=150)
+    tree_style: TreeStyle = "auto"
+
+
+class PhotoAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    crop: list[float] | None = Field(default=None, min_length=4, max_length=4)
+    projection: Literal["auto", "perspective", "panorama"] = "auto"
+    heading: float | None = Field(default=None, ge=0, lt=360)
+    fov: float = Field(default=70, ge=10, le=360)
+    tree_style: TreeStyle = "auto"
+
+    @field_validator("crop")
+    @classmethod
+    def valid_crop(cls, value):
+        if value is not None and (not all(0 <= v <= 1 for v in value) or value[0] >= value[2] or value[1] >= value[3]):
+            raise ValueError("Crop must be [left, top, right, bottom] in 0..1 with positive area.")
+        return value
+
+
+class PedestrianAppearance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    top: HexColor = "#cf754c"
+    bottom: HexColor = "#354c73"
+    shoes: HexColor = "#302d2c"
+
+
+class SceneAnnotation(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    id: str | None = Field(default=None, min_length=1, max_length=80)
+    kind: Literal["tree", "vehicle", "person"]
+    lat: float = Field(ge=-85, le=85)
+    lon: float = Field(ge=-180, le=180)
+    tree_species: TreeStyle = "auto"
+    vehicle_type: VehicleType = "sedan"
+    color: HexColor | None = None
+    appearance: PedestrianAppearance | None = None
+    replace_id: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     name: str = Field(default="RealityForge", min_length=1, max_length=80)
     bbox: list[float] = Field(min_length=4, max_length=4)
-    meters_per_block: Literal[1, 2, 4] = 1
+    meters_per_block: Literal[1, 2, 4, 8] = 1
     source: Literal["live", "demo"] = "live"
     photos: list[PhotoSelection] = Field(default_factory=list, max_length=12)
+    annotations: list[SceneAnnotation] = Field(default_factory=list, max_length=200)
     terrain: bool = False
 
     @field_validator("bbox")
@@ -150,15 +196,19 @@ def photos(files: list[UploadFile] = File(...)):
                 if original.width * original.height > 40_000_000:
                     raise ValueError("Photo exceeds 40 megapixels. Resize it before uploading.")
                 original.load()
+                metadata = extract_photo_metadata(original)
                 clean = ImageOps.exif_transpose(original).convert("RGB")
                 clean.thumbnail((4096, 4096))
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
             raise HTTPException(422, f"Could not read photo: {str(exc)[:150]}") from exc
         photo_id = uuid.uuid4().hex
         path = UPLOADS / f"{photo_id}.jpg"
-        clean.save(path, "JPEG", quality=92)
-        data = analyze_photo(path)
-        data.update(id=photo_id, filename=Path(upload.filename or "photo.jpg").name[:120], url=f"/api/photos/{photo_id}")
+        original_path = UPLOADS / f"{photo_id}.original.jpg"
+        clean.save(original_path, "JPEG", quality=92)
+        (UPLOADS / f"{photo_id}.metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        data = analyze_photo(original_path, metadata=metadata, output_path=path)
+        data.update(id=photo_id, filename=Path(upload.filename or "photo.jpg").name[:120],
+                    url=f"/api/photos/{photo_id}", original_url=f"/api/photos/{photo_id}/original")
         (UPLOADS / f"{photo_id}.json").write_text(json.dumps(data), encoding="utf-8")
         results.append(data)
     return {"photos": results}
@@ -172,14 +222,57 @@ def photo(photo_id: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.get("/api/photos/{photo_id}/original")
+def original_photo(photo_id: str):
+    path = UPLOADS / f"{identifier(photo_id)}.original.jpg"
+    if not path.exists():
+        path = UPLOADS / f"{photo_id}.jpg"  # Older uploads remain editable.
+    if not path.exists():
+        raise HTTPException(404, "Photo not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/api/photos/{photo_id}/analyze")
+def reanalyze_photo(photo_id: str, request: PhotoAnalysisRequest):
+    photo_id = identifier(photo_id)
+    record = UPLOADS / f"{photo_id}.json"
+    if not record.exists():
+        raise HTTPException(404, "Photo not found")
+    previous = json.loads(record.read_text(encoding="utf-8"))
+    original_path = UPLOADS / f"{photo_id}.original.jpg"
+    if not original_path.exists():
+        shutil.copyfile(UPLOADS / f"{photo_id}.jpg", original_path)
+    metadata_path = UPLOADS / f"{photo_id}.metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+    try:
+        result = analyze_photo(original_path, metadata=metadata, output_path=UPLOADS / f"{photo_id}.jpg", **request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    result.update(id=photo_id, filename=previous.get("filename", "photo.jpg"),
+                  url=f"/api/photos/{photo_id}?revision={uuid.uuid4().hex[:8]}",
+                  original_url=f"/api/photos/{photo_id}/original")
+    record.write_text(json.dumps(result), encoding="utf-8")
+    return result
+
+
 @app.post("/api/generate", status_code=202)
 def start_generation(request: GenerationRequest):
     payload = request.model_dump()
+    for annotation in payload["annotations"]:
+        annotation.update(source="user_annotation", confidence=1.0)
     for photo in payload["photos"]:
         path = UPLOADS / f"{photo['id']}.json"
         if not path.exists():
             raise HTTPException(422, "A selected photo no longer exists. Upload it again.")
-        photo.update({**json.loads(path.read_text(encoding="utf-8")), **photo})
+        analysis = json.loads(path.read_text(encoding="utf-8"))
+        selection = dict(photo)
+        photo.update({**analysis, **selection})
+        if selection["projection"] == "auto":
+            photo["projection"] = analysis.get("projection", "perspective")
+        if selection["heading"] is None:
+            photo["heading"] = analysis.get("heading")
+        if photo["projection"] == "panorama":
+            photo["fov"] = 360
     with state_lock:
         if sum(s["status"] in {"queued", "running"} for s in states.values()) >= 3:
             raise HTTPException(429, "The generation queue is full. Wait for a world to finish.")
